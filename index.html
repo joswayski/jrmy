@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>3D Shooter Game</title>
+    <style>
+      body {
+        margin: 0;
+        overflow: hidden;
+      }
+      canvas {
+        display: block;
+      }
+      #ui {
+        position: absolute;
+        top: 20px;
+        left: 20px;
+        color: white;
+        font-family: Arial, sans-serif;
+        font-size: 24px;
+        font-weight: bold;
+        background-color: rgba(0, 0, 0, 0.5);
+        padding: 10px 15px;
+        border-radius: 10px;
+        text-shadow: 2px 2px 3px rgba(0, 0, 0, 0.7);
+      }
+      #crosshair {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 30px;
+        height: 30px;
+        margin-left: -15px;
+        margin-top: -15px;
+        color: white;
+        font-size: 30px;
+        text-align: center;
+        pointer-events: none;
+        text-shadow: 0px 0px 3px rgba(0, 0, 0, 0.9);
+      }
+      #start-screen,
+      #pause-screen {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background-color: rgba(0, 0, 0, 0.7);
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        color: white;
+        font-family: Arial, sans-serif;
+      }
+      #pause-screen {
+        display: none;
+      }
+      .menu-button {
+        padding: 15px 30px;
+        font-size: 22px;
+        margin-top: 20px;
+        cursor: pointer;
+        background-color: #4caf50;
+        color: white;
+        border: none;
+        border-radius: 5px;
+        text-transform: uppercase;
+        font-weight: bold;
+        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+        transition: background-color 0.3s;
+      }
+      .menu-button:hover {
+        background-color: #45a049;
+      }
+      .menu-button.quit {
+        background-color: #f44336;
+      }
+      .menu-button.quit:hover {
+        background-color: #da190b;
+      }
+      .instructions {
+        text-align: center;
+        max-width: 700px;
+        margin: 30px auto;
+        line-height: 1.7;
+        font-size: 18px;
+      }
+      .instructions strong {
+        color: #4caf50;
+        font-size: 20px;
+      }
+      h1 {
+        font-size: 48px;
+        margin-bottom: 20px;
+        text-shadow: 3px 3px 5px rgba(0, 0, 0, 0.5);
+      }
+      #weapon-info {
+        position: absolute;
+        bottom: 20px !important;
+        left: 20px !important;
+        color: white;
+        font-family: Arial, sans-serif;
+        font-size: 24px !important;
+        font-weight: bold;
+        background-color: rgba(0, 0, 0, 0.5);
+        padding: 10px 15px;
+        border-radius: 10px;
+        text-shadow: 2px 2px 3px rgba(0, 0, 0, 0.7);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="ui">
+      Score: <span id="score">0</span> | Health: <span id="health">100</span>
+    </div>
+    <div id="crosshair">+</div>
+    <div id="start-screen">
+      <h1>3D Shooter Game</h1>
+      <div class="instructions">
+        <p><strong>Controls:</strong></p>
+        <p>WASD - Move | Mouse - Aim | Click - Shoot</p>
+        <p><strong>Weapons:</strong></p>
+        <p>1 - Pistol | 2 - Shotgun | 3 - Machine Gun</p>
+        <p>Look for colored cube pickups to find new weapons!</p>
+        <p>Defeat all enemies to win. Watch your health!</p>
+      </div>
+      <button id="start-button" class="menu-button">Start Game</button>
+    </div>
+
+    <div id="pause-screen">
+      <h1>Game Paused</h1>
+      <button id="resume-button" class="menu-button">Resume Game</button>
+      <button id="quit-button" class="menu-button quit">Quit Game</button>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="game.js"></script>
+  </body>
+</html>
