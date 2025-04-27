@@ -1,9 +1,9 @@
 // Game variables
 let scene, camera, renderer;
 let player,
-  playerHealth = 100;
-let score = 0;
-let enemies = [];
+  playerHealth = 100; // This will be managed by the server, but keep for local display/prediction
+let score = 0; // Score might need server-side validation/sync later
+let clientZombies = {}; // { id: { mesh: THREE.Group, data: {} } }
 let bullets = [];
 let obstacles = [];
 let gameActive = false;
@@ -16,6 +16,16 @@ let isJumping = false;
 let velocity = new THREE.Vector3();
 let direction = new THREE.Vector3();
 let clock = new THREE.Clock();
+let lastSentStateTime = 0; // Throttle sending updates
+const stateUpdateInterval = 100; // ms (e.g., 10 times per second)
+
+// Multiplayer variables
+let socket;
+let myId;
+let isHost = false; // Track if this client is the host
+let serverGameInProgress = false; // Track server game state
+let remotePlayers = {}; // { id: { mesh: THREE.Mesh, data: {} } }
+
 let muzzleFlash = null;
 
 // Weapon variables
@@ -53,6 +63,7 @@ let weapons = {
 const startScreen = document.getElementById("start-screen");
 const pauseScreen = document.getElementById("pause-screen");
 const startButton = document.getElementById("start-button");
+const hostStartButton = document.getElementById("host-start-button"); // Get host button
 const resumeButton = document.getElementById("resume-button");
 const quitButton = document.getElementById("quit-button");
 const scoreElement = document.getElementById("score");
@@ -77,15 +88,27 @@ weaponElement.style.display = "none";
 
 // Initialize game when start button is clicked
 startButton.addEventListener("click", () => {
+  // This button now just initializes the client and connects
   startScreen.style.display = "none";
-  gameActive = true;
-  // Show UI elements when game starts
-  uiElement.style.display = "block";
-  crosshairElement.style.display = "block";
-  weaponElement.style.display = "block";
+  // gameActive = true; // Don't activate locally until server confirms
+  // Show UI elements when game starts (maybe wait?)
+  // uiElement.style.display = "block";
+  // crosshairElement.style.display = "block";
+  // weaponElement.style.display = "block";
   init();
-  animate();
-  updateWeaponDisplay();
+  animate(); // Start rendering loop
+  updateWeaponDisplay(); // Needs initial setup
+  // Connect to server AFTER basic init
+  connectToServer();
+});
+
+// Add listener for host start button
+hostStartButton.addEventListener("click", () => {
+  if (socket && socket.connected && isHost && !serverGameInProgress) {
+    console.log("Host clicking Start Game...");
+    socket.emit("startGame");
+    hostStartButton.style.display = "none"; // Hide after clicking
+  }
 });
 
 // Pause menu event listeners
@@ -109,6 +132,9 @@ quitButton.addEventListener("click", () => {
   crosshairElement.style.display = "none";
   weaponElement.style.display = "none";
   resetGame();
+  if (socket) {
+    socket.disconnect(); // Disconnect from server
+  }
 });
 
 // Initialize the game
@@ -153,23 +179,24 @@ function init() {
   floor.receiveShadow = true;
   scene.add(floor);
 
-  // Create player
+  // Create local player
   player = new THREE.Object3D();
-  player.position.set(0, 1.6, 0);
+  // player.position will be set by server initially or default
   scene.add(player);
-  camera.position.set(0, 0, 0);
+  camera.position.set(0, 1.6, 0); // Set camera relative to player container
   player.add(camera);
 
   // Create weapon model
   createWeaponModel();
 
-  // Create environment
+  // Create environment (obstacles) - keep client-side for collision detection?
+  // Or sync from server? For now, keep client-side for simplicity.
   createEnvironment();
 
-  // Create enemies
-  createEnemies();
+  // Create enemies - Will be handled by server sync
+  // createEnemies();
 
-  // Create weapon pickups
+  // Create weapon pickups - Keep client-side for now
   createWeaponPickups();
 
   // Set up controls
@@ -178,6 +205,339 @@ function init() {
   // Window resize handler
   window.addEventListener("resize", onWindowResize);
 }
+
+// --- Multiplayer Functions ---
+
+function connectToServer() {
+  // Ensure using the correct server address (localhost for local testing)
+  const serverAddress =
+    window.location.hostname === "localhost" ? "http://localhost:3000" : ""; // Use relative path if served from same origin, otherwise specify full address
+  console.log(
+    `Attempting to connect to server at: ${serverAddress || "relative path"}`
+  );
+  socket = io(serverAddress); // Connect to the server address
+
+  socket.on("connect_error", (err) => {
+    console.error("Connection Error:", err);
+    // Display error to user?
+    startScreen.style.display = "flex";
+    startScreen.querySelector("h1").textContent = "Connection Failed";
+    startScreen.querySelector(
+      "p"
+    ).textContent = `Could not connect to server. Is it running? ${err.message}`;
+    gameActive = false;
+  });
+
+  socket.on("connect", () => {
+    console.log("Successfully connected to server with ID:", socket.id);
+  });
+
+  socket.on("initialize", (data) => {
+    myId = data.id;
+    isHost = data.isHost; // Store host status
+    serverGameInProgress = data.gameInProgress; // Store game status
+    console.log(
+      `Received initialization data. My ID: ${myId}, Host: ${isHost}, Game Started: ${serverGameInProgress}`
+    );
+
+    // Show Host Start button if applicable
+    if (isHost && !serverGameInProgress) {
+      console.log("Showing Host Start Button");
+      hostStartButton.style.display = "block";
+    } else {
+      hostStartButton.style.display = "none";
+    }
+
+    // Only activate game fully if it's already in progress or started
+    if (serverGameInProgress) {
+      activateGameUI();
+    }
+
+    // Set local player's initial position based on server data
+    if (data.players[myId]) {
+      player.position.set(
+        data.players[myId].x,
+        data.players[myId].y,
+        data.players[myId].z
+      );
+      player.rotation.y = data.players[myId].rotationY || 0;
+      camera.rotation.x = data.players[myId].rotationX || 0;
+      playerHealth = data.players[myId].health;
+      healthElement.textContent = playerHealth;
+      currentWeapon = data.players[myId].currentWeapon || "pistol";
+      updateWeaponDisplay();
+      createWeaponModel(); // Update weapon model based on server state
+    } else {
+      console.warn("My player data not found in initialization payload?");
+      // Use a default starting position if not provided?
+      player.position.set(0, 1.6, 0);
+    }
+
+    // Add existing players
+    for (const playerId in data.players) {
+      if (playerId !== myId) {
+        addRemotePlayer(data.players[playerId]);
+      }
+    }
+
+    // Add existing zombies
+    console.log("Initializing existing zombies:", data.zombies);
+    for (const zombieId in data.zombies) {
+      addOrUpdateZombie(data.zombies[zombieId]);
+    }
+  });
+
+  socket.on("playerJoined", (playerData) => {
+    console.log("Player joined:", playerData.id);
+    if (playerData.id !== myId) {
+      addRemotePlayer(playerData);
+    }
+  });
+
+  socket.on("playerUpdated", (playerData) => {
+    if (playerData.id !== myId) {
+      updateRemotePlayer(playerData);
+    }
+  });
+
+  socket.on("playerShot", (shotData) => {
+    if (shotData.shooterId !== myId && remotePlayers[shotData.shooterId]) {
+      console.log(`Player ${shotData.shooterId} shot with ${shotData.weapon}`);
+      // TODO: Add visual/audio effect for remote player shooting
+      // Maybe show a muzzle flash on their weapon model?
+      playShootSound(
+        shotData.weapon,
+        remotePlayers[shotData.shooterId].mesh.position
+      ); // Play sound from their location
+    }
+  });
+
+  socket.on("playerLeft", (playerId) => {
+    console.log("Player left:", playerId);
+    removeRemotePlayer(playerId);
+  });
+
+  socket.on("healthUpdate", (data) => {
+    if (data.id === myId) {
+      playerHealth = data.health;
+      healthElement.textContent = playerHealth;
+      console.log("My health updated:", playerHealth);
+      // Add a visual hit indicator (e.g., screen flash red briefly)
+      document.body.style.backgroundColor = "rgba(255, 0, 0, 0.3)";
+      setTimeout(() => {
+        document.body.style.backgroundColor = "";
+      }, 150);
+    } else if (remotePlayers[data.id]) {
+      remotePlayers[data.id].data.health = data.health;
+      console.log(`Player ${data.id} health updated: ${data.health}`);
+      // Could update remote player visual based on health?
+    }
+  });
+
+  socket.on("playerDied", (playerId) => {
+    console.log(`Player ${playerId} died.`);
+    if (playerId === myId) {
+      // Handled by respawn logic for now
+      console.log("I died!");
+      // Optionally show a "You died" message before respawn clears it
+    } else if (remotePlayers[playerId]) {
+      // Maybe make the remote player visually disappear or play death animation
+      remotePlayers[playerId].mesh.visible = false; // Hide temporarily
+      console.log(`Remote player ${playerId} mesh hidden.`);
+    }
+  });
+
+  socket.on("respawn", (data) => {
+    if (socket.id === myId) {
+      // Check if the respawn message is for me
+      console.log("Received respawn instruction.");
+      player.position.set(data.x, data.y, data.z);
+      playerHealth = 100; // Reset health locally
+      healthElement.textContent = playerHealth;
+      velocity.set(0, 0, 0); // Reset velocity
+      isJumping = false;
+      // Reset UI elements or show respawn message?
+      startScreen.style.display = "none"; // Ensure start screen is hidden if it popped up
+      uiElement.style.display = "block";
+      crosshairElement.style.display = "block";
+      weaponElement.style.display = "block";
+      if (isPaused) togglePause(); // Force unpause if needed
+    } else if (remotePlayers[myId]) {
+      // This check seems wrong, should check if respawn ID matches a remote player
+      console.warn("Received respawn for a remote player? ID:", myId); // Likely error in logic or server sending
+    } else {
+      // Respawn message for a remote player who died earlier
+      const respawnedPlayerId = Object.keys(remotePlayers).find(
+        (id) => remotePlayers[id].data.health <= 0
+      ); // Needs better tracking
+      if (respawnedPlayerId && remotePlayers[respawnedPlayerId]) {
+        remotePlayers[respawnedPlayerId].mesh.position.set(
+          data.x,
+          data.y,
+          data.z
+        );
+        remotePlayers[respawnedPlayerId].data.health = 100;
+        remotePlayers[respawnedPlayerId].mesh.visible = true; // Make visible again
+        console.log(`Remote player ${respawnedPlayerId} respawned.`);
+      } else if (remotePlayers[data.id]) {
+        // Check if respawn is for existing remote player
+        remotePlayers[data.id].mesh.position.set(data.x, data.y, data.z);
+        remotePlayers[data.id].data.health = 100;
+        remotePlayers[data.id].mesh.visible = true;
+        console.log(`Remote player ${data.id} respawned.`);
+      }
+    }
+  });
+
+  socket.on("disconnect", () => {
+    console.log("Disconnected from server");
+    // Handle disconnection (show message, disable input, etc.)
+    gameActive = false;
+    startScreen.style.display = "flex";
+    startScreen.querySelector("h1").textContent = "Disconnected";
+    startScreen.querySelector("p").textContent =
+      "Lost connection to the server.";
+    resetGame(); // Clean up local state
+  });
+
+  // Add listener for game starting
+  socket.on("gameStarted", () => {
+    console.log("Received gameStarted event from server.");
+    serverGameInProgress = true;
+    hostStartButton.style.display = "none"; // Hide button if it was visible
+    activateGameUI(); // Show game UI for all players
+    gameActive = true; // Allow local updates/input now
+  });
+
+  // Add listener for zombies spawning
+  socket.on("zombiesSpawned", (zombieData) => {
+    console.log("Received zombiesSpawned event:", zombieData);
+    for (const zombieId in zombieData) {
+      addOrUpdateZombie(zombieData[zombieId]);
+    }
+  });
+
+  // TODO: Add listener for zombie updates (position, health)
+  socket.on("zombieUpdate", (updateData) => {
+    // updateData could be an object { id: zombieId, x, y, z, health, ... }
+    // Or an array of updates [ {id, ...}, {id, ...} ]
+    console.log("Received zombieUpdate (TODO: Implement handling)", updateData);
+    // Example for single update:
+    // if(clientZombies[updateData.id]) {
+    //    updateZombie(updateData);
+    // }
+  });
+
+  // TODO: Add listener for zombie death
+  socket.on("zombieDied", (zombieId) => {
+    console.log(`Received zombieDied event for ${zombieId}`);
+    removeZombie(zombieId);
+  });
+}
+
+// Helper function to show game UI
+function activateGameUI() {
+  console.log("Activating Game UI");
+  uiElement.style.display = "block";
+  crosshairElement.style.display = "block";
+  weaponElement.style.display = "block";
+  // If not already locked, attempt pointer lock
+  if (document.pointerLockElement !== renderer.domElement) {
+    renderer.domElement.requestPointerLock();
+  }
+}
+
+// --- Define Player Models ---
+
+// Function to create the fat guy model
+function createFatGuyModel() {
+  const modelGroup = new THREE.Group();
+
+  // Main body (large sphere)
+  const bodyRadius = 0.8;
+  const bodyGeometry = new THREE.SphereGeometry(bodyRadius, 16, 12);
+  const bodyMaterial = new THREE.MeshStandardMaterial({
+    color: 0x8888ff,
+    roughness: 0.7,
+  }); // Light blueish color
+  const bodyMesh = new THREE.Mesh(bodyGeometry, bodyMaterial);
+  bodyMesh.position.y = bodyRadius; // Position so bottom is near y=0
+  modelGroup.add(bodyMesh);
+
+  // Head (smaller sphere on top)
+  const headRadius = 0.3;
+  const headGeometry = new THREE.SphereGeometry(headRadius, 12, 10);
+  const headMaterial = new THREE.MeshStandardMaterial({
+    color: 0xffccaa,
+    roughness: 0.8,
+  }); // Skin-like color
+  const headMesh = new THREE.Mesh(headGeometry, headMaterial);
+  headMesh.position.y = bodyRadius * 2 + headRadius * 0.8; // Position above body
+  modelGroup.add(headMesh);
+
+  // Simple limbs (optional - cylinders or smaller spheres)
+  const limbRadius = 0.2;
+  const limbHeight = 0.6;
+  const limbGeometry = new THREE.CylinderGeometry(
+    limbRadius,
+    limbRadius * 0.8,
+    limbHeight,
+    8
+  );
+  const limbMaterial = bodyMaterial; // Use same color as body
+
+  // Arms
+  const leftArm = new THREE.Mesh(limbGeometry, limbMaterial);
+  leftArm.position.set(-bodyRadius, bodyRadius * 1.2, 0);
+  leftArm.rotation.z = Math.PI / 6; // Angle slightly down
+  modelGroup.add(leftArm);
+
+  const rightArm = new THREE.Mesh(limbGeometry, limbMaterial);
+  rightArm.position.set(bodyRadius, bodyRadius * 1.2, 0);
+  rightArm.rotation.z = -Math.PI / 6; // Angle slightly down
+  modelGroup.add(rightArm);
+
+  // Legs (shorter cylinders)
+  const legHeight = 0.5;
+  const legGeometry = new THREE.CylinderGeometry(
+    limbRadius * 1.2,
+    limbRadius,
+    legHeight,
+    8
+  );
+
+  const leftLeg = new THREE.Mesh(legGeometry, limbMaterial);
+  leftLeg.position.set(-bodyRadius * 0.5, legHeight / 2, 0);
+  modelGroup.add(leftLeg);
+
+  const rightLeg = new THREE.Mesh(legGeometry, limbMaterial);
+  rightLeg.position.set(bodyRadius * 0.5, legHeight / 2, 0);
+  modelGroup.add(rightLeg);
+
+  // Add a weapon holder (empty Object3D)
+  const weaponHolder = new THREE.Object3D();
+  weaponHolder.name = "weaponHolder";
+  // Position it near the right hand roughly
+  weaponHolder.position.set(
+    bodyRadius * 0.8,
+    bodyRadius * 1.1,
+    bodyRadius * 0.3
+  ); // Adjust x, y, z as needed
+  weaponHolder.rotation.y = -Math.PI / 12; // Slight angle outward
+  modelGroup.add(weaponHolder);
+
+  // Add shadows to all parts
+  modelGroup.traverse((child) => {
+    if (child instanceof THREE.Mesh) {
+      child.castShadow = true;
+      child.receiveShadow = true; // Parts can receive shadows from other parts
+    }
+  });
+
+  return modelGroup;
+}
+
+// --- End Player Models ---
 
 // Create a simple weapon model attached to the camera
 function createWeaponModel() {
@@ -370,152 +730,20 @@ function createEnvironment() {
   scene.add(skybox);
 }
 
-// Create enemy targets
-function createEnemies() {
-  // Create zombie body parts
-  const bodyGeometry = new THREE.BoxGeometry(0.8, 1.2, 0.4);
-  const headGeometry = new THREE.SphereGeometry(0.3, 16, 16);
-  const armGeometry = new THREE.BoxGeometry(0.2, 0.8, 0.2);
-  const legGeometry = new THREE.BoxGeometry(0.2, 0.8, 0.2);
+// Create enemy targets - REMOVED OLD CLIENT-SIDE LOGIC
+/*
+function createEnemies() { ... }
+*/
 
-  // Create some zombies at random positions
-  for (let i = 0; i < 10; i++) {
-    // Create zombie container
-    const zombie = new THREE.Group();
+// Create a health bar for an enemy - REMOVED OLD CLIENT-SIDE LOGIC
+/*
+function createHealthBar(enemy) { ... }
+*/
 
-    // Create a new material instance for each zombie
-    const zombieMaterial = new THREE.MeshStandardMaterial({
-      color: 0x556b2f,
-      roughness: 0.8,
-      metalness: 0.2,
-    });
-
-    // Create body parts
-    const body = new THREE.Mesh(bodyGeometry, zombieMaterial);
-    const head = new THREE.Mesh(headGeometry, zombieMaterial);
-    const leftArm = new THREE.Mesh(armGeometry, zombieMaterial);
-    const rightArm = new THREE.Mesh(armGeometry, zombieMaterial);
-    const leftLeg = new THREE.Mesh(legGeometry, zombieMaterial);
-    const rightLeg = new THREE.Mesh(legGeometry, zombieMaterial);
-
-    // Position body parts
-    body.position.y = 0.6;
-    head.position.y = 1.5;
-    leftArm.position.set(-0.5, 0.6, 0);
-    rightArm.position.set(0.5, 0.6, 0);
-    leftLeg.position.set(-0.2, 0, 0);
-    rightLeg.position.set(0.2, 0, 0);
-
-    // Add body parts to zombie
-    zombie.add(body);
-    zombie.add(head);
-    zombie.add(leftArm);
-    zombie.add(rightArm);
-    zombie.add(leftLeg);
-    zombie.add(rightLeg);
-
-    // Add some random rotation to make zombies look more undead
-    head.rotation.x = Math.random() * 0.2 - 0.1;
-    head.rotation.z = Math.random() * 0.2 - 0.1;
-    body.rotation.z = Math.random() * 0.1 - 0.05;
-
-    // Position zombie at random location
-    const x = Math.random() * 100 - 50;
-    const z = Math.random() * 100 - 50;
-    zombie.position.set(x, 0.4, z); // Raise zombie to proper height
-
-    // Add shadows
-    zombie.traverse((object) => {
-      if (object instanceof THREE.Mesh) {
-        object.castShadow = true;
-      }
-    });
-
-    // Add zombie properties
-    zombie.userData.health = 100;
-    zombie.userData.maxHealth = 100;
-    zombie.userData.isEnemy = true;
-    zombie.userData.isAggro = false;
-    zombie.userData.animationTime = Math.random() * Math.PI * 2; // Random start phase
-    zombie.userData.animationSpeed = 0.5 + Math.random() * 0.5; // Random speed
-
-    // Create health bar
-    createHealthBar(zombie);
-
-    scene.add(zombie);
-    enemies.push(zombie);
-  }
-}
-
-// Create a health bar for an enemy
-function createHealthBar(enemy) {
-  // Create health bar container
-  const healthBarContainer = new THREE.Object3D();
-  healthBarContainer.name = "healthBarContainer";
-
-  // Create background bar
-  const barGeometry = new THREE.PlaneGeometry(1.2, 0.2);
-  const backgroundMaterial = new THREE.MeshBasicMaterial({
-    color: 0x333333,
-    side: THREE.DoubleSide,
-    transparent: true,
-    opacity: 0,
-  });
-  const backgroundBar = new THREE.Mesh(barGeometry, backgroundMaterial);
-
-  // Create health indicator bar
-  const healthBarGeometry = new THREE.PlaneGeometry(1.2, 0.2);
-  const healthBarMaterial = new THREE.MeshBasicMaterial({
-    color: 0x00ff00,
-    side: THREE.DoubleSide,
-    transparent: true,
-    opacity: 0,
-  });
-  const healthBar = new THREE.Mesh(healthBarGeometry, healthBarMaterial);
-  healthBar.name = "healthIndicator";
-
-  // Position the health bar above the enemy
-  healthBarContainer.position.set(0, 2.5, 0);
-  healthBar.position.set(0, 0, 0.01); // Slightly in front of background
-
-  // Add to container
-  healthBarContainer.add(backgroundBar);
-  healthBarContainer.add(healthBar);
-
-  // Add container to enemy
-  enemy.add(healthBarContainer);
-
-  // Initial rotation to face player
-  healthBarContainer.lookAt(player.position);
-}
-
-// Update enemy health bars
-function updateHealthBars() {
-  enemies.forEach((enemy) => {
-    if (enemy.userData.health <= 0) return;
-
-    const healthBarContainer = enemy.getObjectByName("healthBarContainer");
-    if (!healthBarContainer) return;
-
-    const healthBar = healthBarContainer.getObjectByName("healthIndicator");
-    if (!healthBar) return;
-
-    const healthPercent = enemy.userData.health / enemy.userData.maxHealth;
-
-    // Scale health bar based on current health
-    healthBar.scale.x = healthPercent;
-    healthBar.position.x = -0.6 * (1 - healthPercent); // Align left edge
-
-    // Change color based on health percentage
-    if (healthPercent > 0.6) {
-      healthBar.material.color.setHex(0x00ff00); // Green
-    } else if (healthPercent > 0.3) {
-      healthBar.material.color.setHex(0xffff00); // Yellow
-    } else {
-      healthBar.material.color.setHex(0xff0000); // Red
-    }
-  });
-}
+// Update enemy health bars - REMOVED OLD CLIENT-SIDE LOGIC
+/*
+function updateHealthBars() { ... }
+*/
 
 // Set up keyboard and mouse controls
 function setupControls() {
@@ -610,16 +838,45 @@ function setupControls() {
 
 // Switch to a different weapon
 function switchWeapon(weaponType) {
-  if (weapons[weaponType]) {
+  if (weapons[weaponType] && currentWeapon !== weaponType) {
     currentWeapon = weaponType;
     updateWeaponDisplay();
     createWeaponModel();
+    // Notify server about weapon change
+    if (socket && socket.connected) {
+      socket.emit("playerUpdate", { currentWeapon: currentWeapon });
+    }
   }
 }
 
 // Update the weapon UI display
 function updateWeaponDisplay() {
   weaponElement.textContent = `Weapon: ${currentWeapon}`;
+}
+
+// Helper to play shoot sound (can be called locally and for remote shots)
+function playShootSound(weaponType, position = null) {
+  let soundFile = "";
+  const weapon = weapons[weaponType];
+  if (!weapon) return;
+
+  switch (weaponType) {
+    case "pistol":
+      soundFile = "sounds/pistol_shot.wav"; // Replace with your actual file path
+      break;
+    case "shotgun":
+      soundFile = "sounds/shotgun_shot.wav"; // Replace with your actual file path
+      break;
+    case "machineGun":
+      soundFile = "sounds/machine_gun_shot.wav"; // Replace with your actual file path
+      break;
+  }
+
+  if (soundFile) {
+    const shootSound = new Audio(soundFile);
+    // TODO: Implement positional audio if position is provided
+    shootSound.play();
+  }
 }
 
 // Create a bullet and shoot based on current weapon
@@ -635,30 +892,19 @@ function shoot() {
   // Update last fired time
   weapon.lastFired = now;
 
-  // Play weapon sound
-  let soundFile = "";
-  switch (currentWeapon) {
-    case "pistol":
-      soundFile = "sounds/pistol_shot.wav"; // Replace with your actual file path
-      break;
-    case "shotgun":
-      soundFile = "sounds/shotgun_shot.wav"; // Replace with your actual file path
-      break;
-    case "machineGun":
-      soundFile = "sounds/machine_gun_shot.wav"; // Replace with your actual file path
-      break;
-  }
+  // Play weapon sound LOCALLY
+  playShootSound(currentWeapon);
 
-  if (soundFile) {
-    const shootSound = new Audio(soundFile);
-    shootSound.play();
+  // Notify the server that we shot
+  if (socket && socket.connected) {
+    socket.emit("shoot", {
+      weapon: currentWeapon /*, add direction/target info if needed */,
+    });
   }
 
   // Show muzzle flash
   if (muzzleFlash) {
     muzzleFlash.material.opacity = 1.0;
-
-    // Hide after short delay
     setTimeout(() => {
       if (muzzleFlash) {
         muzzleFlash.material.opacity = 0.0;
@@ -666,19 +912,18 @@ function shoot() {
     }, 50);
   }
 
-  // Handle different weapon types
+  // Handle different weapon types (client-side bullet creation for immediate feedback)
+  // Server should validate and handle actual hit detection / damage
   if (currentWeapon === "shotgun") {
-    // Shotgun fires multiple pellets in a spread
     for (let i = 0; i < weapon.pellets; i++) {
       createBullet(weapon, true);
     }
   } else {
-    // Single bullet for other weapons
     createBullet(weapon, false);
   }
 }
 
-// Create an individual bullet
+// Create an individual bullet (client-side for visual effect)
 function createBullet(weapon, applyShotgunSpread) {
   const bulletGeometry = new THREE.SphereGeometry(weapon.bulletSize, 8, 8);
   const bulletMaterial = new THREE.MeshBasicMaterial({
@@ -686,25 +931,20 @@ function createBullet(weapon, applyShotgunSpread) {
   });
   const bullet = new THREE.Mesh(bulletGeometry, bulletMaterial);
 
-  // Get the camera's world position and direction
   const cameraWorldPos = new THREE.Vector3();
   camera.getWorldPosition(cameraWorldPos);
 
-  // Get the camera's forward direction using its world matrix
   const cameraDirection = new THREE.Vector3(0, 0, -1);
   cameraDirection.applyMatrix4(camera.matrixWorld);
   cameraDirection.sub(cameraWorldPos).normalize();
 
-  // Position the bullet slightly in front of the camera
-  const bulletDistance = 1; // Distance in front of camera to spawn bullet
+  const bulletDistance = 0.5; // Start closer to camera/player center
   bullet.position
     .copy(cameraWorldPos)
     .add(cameraDirection.clone().multiplyScalar(bulletDistance));
 
-  // Set bullet direction based on camera look direction
   const bulletDirection = cameraDirection.clone();
 
-  // Apply spread for shotgun
   if (applyShotgunSpread) {
     bulletDirection.x += (Math.random() - 0.5) * weapon.spread;
     bulletDirection.y += (Math.random() - 0.5) * weapon.spread;
@@ -715,165 +955,109 @@ function createBullet(weapon, applyShotgunSpread) {
   bullet.userData.velocity = bulletDirection.multiplyScalar(weapon.bulletSpeed);
   bullet.userData.alive = true;
   bullet.userData.isBullet = true;
-  bullet.userData.damage = weapon.damage;
+  bullet.userData.damage = weapon.damage; // Keep damage info for potential client-side hit checks
+  bullet.userData.ownerId = myId; // Mark who shot this bullet
 
   scene.add(bullet);
   bullets.push(bullet);
 }
 
-// Check if a bullet hit an enemy or obstacle
+// Check if a bullet hit an enemy or obstacle (or REMOTE PLAYER)
 function checkBulletCollisions() {
-  for (let i = 0; i < bullets.length; i++) {
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    // Iterate backwards for safe removal
     const bullet = bullets[i];
-    if (!bullet.userData.alive) continue;
+    if (!bullet || !bullet.userData.alive) continue;
 
-    // Check collision with each enemy
-    for (let j = 0; j < enemies.length; j++) {
-      const enemy = enemies[j];
-      if (enemy.userData.health <= 0) continue;
+    let bulletRemoved = false;
 
-      // Simple distance-based collision detection
-      const distance = bullet.position.distanceTo(enemy.position);
-      if (distance < 1) {
-        // Enemy hit, reduce health
-        enemy.userData.health -= bullet.userData.damage;
-        enemy.userData.isAggro = true; // Set aggro when hit
-        bullet.userData.alive = false;
-        scene.remove(bullet);
+    // Check collision with remote players - DISABLED FOR PvE
+    /*
+    for (const playerId in remotePlayers) {
+        if (playerId === bullet.userData.ownerId) continue; // Don't hit self
 
-        // Create hit impact effect
-        createHitEffect(bullet.position.clone());
+        const remotePlayer = remotePlayers[playerId];
+        if (!remotePlayer || !remotePlayer.mesh || !remotePlayer.mesh.visible) continue; // Skip if player doesn't exist or is dead/hidden
 
-        if (enemy.userData.health <= 0) {
-          // Flag as dead immediately
-          enemy.userData.isDead = true;
+        // Simple distance check (could use bounding boxes for better accuracy)
+        const distance = bullet.position.distanceTo(remotePlayer.mesh.position);
+        const hitRadius = 1.0; // Adjust based on player model size
 
-          // Remove health bar immediately
-          const healthBarContainer =
-            enemy.getObjectByName("healthBarContainer");
-          if (healthBarContainer) {
-            enemy.remove(healthBarContainer);
-          }
-
-          // Enemy defeated animation - red flash
-          enemy.traverse((object) => {
-            if (object instanceof THREE.Mesh) {
-              object.material.emissive.setHex(0xff0000);
-              object.material.transparent = true;
-              object.material.opacity = 0.8;
+        if (distance < hitRadius) {
+            console.log(`Client-side hit detected on player ${playerId}`);
+            // Notify server about the hit
+            if (socket && socket.connected) {
+                socket.emit('takeDamage', { playerId: playerId, damage: bullet.userData.damage });
             }
-          });
 
-          // Remove enemy from the array immediately to stop processing it
-          const index = enemies.indexOf(enemy);
-          if (index > -1) {
-            enemies.splice(index, 1);
-          }
-
-          // Simple death animation - sink into the ground and disappear
-          const deathDuration = 1000; // 1 second
-          const startTime = Date.now();
-          const startY = enemy.position.y;
-
-          function animateDeath() {
-            const elapsed = Date.now() - startTime;
-            const progress = Math.min(elapsed / deathDuration, 1);
-
-            // Sink into ground
-            enemy.position.y = startY - progress * 1.5;
-
-            // Fade out
-            enemy.traverse((object) => {
-              if (object instanceof THREE.Mesh) {
-                object.material.opacity = 0.8 * (1 - progress);
-              }
-            });
-
-            if (progress < 1) {
-              requestAnimationFrame(animateDeath);
-            } else {
-              // Completely remove from scene when animation is done
-              scene.remove(enemy);
-            }
-          }
-
-          // Start death animation
-          animateDeath();
-
-          score += 100;
-          scoreElement.textContent = score;
-        } else {
-          // Enemy hit, but not dead yet
-
-          // Use the parent enemy's userData to track flashing state for the shared material
-          if (!enemy.userData.isFlashingRed) {
-            // Get the material (assuming all parts share the same one)
-            const material = enemy.children[0]?.material;
-            if (material) {
-              // Store original emissive color on the parent enemy object
-              enemy.userData.originalEmissive = material.emissive.clone();
-              enemy.userData.isFlashingRed = true; // Mark parent as flashing
-
-              // Set the shared material to red
-              material.emissive.setHex(0xff0000);
-
-              // Reset to original color after delay
-              setTimeout(() => {
-                // Check if the enemy still exists, is alive, and is still marked as flashing
-                // (prevents issues if killed during the timeout)
-                if (
-                  enemies.includes(enemy) &&
-                  enemy.userData.health > 0 &&
-                  enemy.userData.isFlashingRed
-                ) {
-                  const currentMaterial = enemy.children[0]?.material;
-                  if (currentMaterial) {
-                    // Restore the original emissive color
-                    if (enemy.userData.originalEmissive) {
-                      currentMaterial.emissive.copy(
-                        enemy.userData.originalEmissive
-                      );
-                    } else {
-                      // Fallback: Reset to black if original somehow wasn't stored
-                      currentMaterial.emissive.setHex(0x000000);
-                    }
-                  }
-                }
-                // Clean up flags on the parent enemy object regardless of checks above
-                delete enemy.userData.isFlashingRed;
-                delete enemy.userData.originalEmissive;
-              }, 100); // Reset after 100ms
-            }
-          }
-          // If already flashing, do nothing - the existing timeout will handle the reset.
+            // Remove bullet visually on client
+            createHitEffect(bullet.position.clone()); // Show hit effect
+            bullet.userData.alive = false;
+            scene.remove(bullet);
+            bullets.splice(i, 1); // Remove from array
+            bulletRemoved = true;
+            break; // Bullet can only hit one player
         }
-
-        break;
-      }
     }
+    */
 
-    // Check collision with obstacles
+    if (bulletRemoved) continue; // Go to next bullet if already removed (though shouldn't happen now)
+
+    // Check collision with obstacles (keep client-side for immediate feedback)
     if (bullet.userData.alive) {
       for (let j = 0; j < obstacles.length; j++) {
         const obstacle = obstacles[j];
+        // Create a bounding box for the obstacle for more accurate collision
+        const obstacleBox = new THREE.Box3().setFromObject(obstacle);
 
-        // Simple distance-based collision detection
-        const distance = bullet.position.distanceTo(obstacle.position);
-        if (distance < obstacle.geometry.parameters.width / 2 + 0.5) {
+        // Check if bullet position is inside the obstacle's bounding box
+        if (obstacleBox.containsPoint(bullet.position)) {
           // Bullet hit obstacle
+          createHitEffect(bullet.position.clone());
           bullet.userData.alive = false;
           scene.remove(bullet);
-
-          // Create hit impact effect
-          createHitEffect(bullet.position.clone());
+          bullets.splice(i, 1); // Remove from array
+          bulletRemoved = true;
           break;
+        }
+      }
+    }
+
+    // TODO: Check client-side collision with ZOMBIES for immediate feedback?
+    // Note: Server should be the authority on damage/death
+    if (bullet.userData.alive && !bulletRemoved) {
+      for (const zombieId in clientZombies) {
+        const zombie = clientZombies[zombieId];
+        if (!zombie || !zombie.mesh) continue;
+
+        // Simple distance check for now
+        const distance = bullet.position.distanceTo(zombie.mesh.position);
+        const hitRadius = 1.0; // Adjust based on zombie model size
+
+        if (distance < hitRadius) {
+          console.log(`Client-side bullet hit detected on zombie ${zombieId}`);
+          createHitEffect(bullet.position.clone()); // Show hit effect
+          // Remove bullet locally
+          bullet.userData.alive = false;
+          scene.remove(bullet);
+          bullets.splice(i, 1);
+          bulletRemoved = true;
+
+          // Notify server about the hit
+          if (socket && socket.connected) {
+            socket.emit("zombieHit", {
+              zombieId: zombieId,
+              damage: bullet.userData.damage,
+            });
+          }
+          break; // Bullet hits one zombie
         }
       }
     }
   }
 
-  // Remove dead bullets
-  bullets = bullets.filter((bullet) => bullet.userData.alive);
+  // Clean up any remaining dead bullets (should be less necessary now)
+  // bullets = bullets.filter((bullet) => bullet.userData.alive);
 }
 
 // Create visual effect for bullet impact
@@ -942,22 +1126,33 @@ function createHitEffect(position) {
 
 // Check for collision between player and obstacles
 function checkPlayerCollisions() {
+  // Keep obstacle collision logic
+  const playerBox = new THREE.Box3().setFromCenterAndSize(
+    player.position,
+    new THREE.Vector3(1, 1.8, 1) // Approximate player size
+  );
+
   for (let i = 0; i < obstacles.length; i++) {
     const obstacle = obstacles[i];
+    const obstacleBox = new THREE.Box3().setFromObject(obstacle);
 
-    // Simple distance-based collision detection
-    const distance = player.position.distanceTo(obstacle.position);
-    const minDistance = obstacle.geometry.parameters.width / 2 + 0.5;
-
-    if (distance < minDistance) {
-      // Push player away from obstacle
+    if (playerBox.intersectsBox(obstacleBox)) {
+      // More robust collision response needed here - push player out correctly
+      // Simple pushback based on direction (can get stuck)
       const pushDirection = new THREE.Vector3()
         .subVectors(player.position, obstacle.position)
         .normalize();
+      pushDirection.y = 0; // Don't push vertically from obstacles usually
 
-      player.position.add(
-        pushDirection.multiplyScalar(minDistance - distance + 0.1)
-      );
+      // Calculate overlap (less precise with this simple push)
+      const overlap = 0.1; // Small push amount
+      player.position.add(pushDirection.multiplyScalar(overlap));
+
+      // Prevent falling through floor after collision
+      if (player.position.y < 1.6) {
+        player.position.y = 1.6;
+        velocity.y = Math.max(0, velocity.y); // Stop downward velocity if hitting side
+      }
     }
   }
 
@@ -969,13 +1164,14 @@ function checkPlayerCollisions() {
       if (distance < 1.5) {
         // Picked up weapon
         switchWeapon(object.userData.weaponType);
-        scene.remove(object);
+        scene.remove(object); // Remove locally
+        // TODO: Notify server that this pickup was taken? Or server manages pickups?
       }
     }
   });
 }
 
-// Update player position based on keyboard input
+// Update player position based on keyboard input AND send to server
 function updatePlayer(deltaTime) {
   // Apply gravity
   velocity.y -= 9.8 * deltaTime;
@@ -988,22 +1184,17 @@ function updatePlayer(deltaTime) {
   // Movement speed
   const speed = 5.0;
 
-  // Move player based on keyboard input
-  if (moveForward || moveBackward) {
-    velocity.z = direction.z * speed;
-  } else {
-    velocity.z = 0;
-  }
+  // Calculate velocity based on input
+  const forwardVelocity = direction.z * speed;
+  const sideVelocity = direction.x * speed;
 
-  if (moveLeft || moveRight) {
-    velocity.x = direction.x * speed;
-  } else {
-    velocity.x = 0;
-  }
+  // Apply velocity relative to player's rotation
+  const moveDirection = new THREE.Vector3(sideVelocity, 0, forwardVelocity);
+  moveDirection.applyQuaternion(player.quaternion); // Apply player's Y rotation
 
-  // Apply velocity to player position
-  player.translateZ(velocity.z * deltaTime);
-  player.translateX(velocity.x * deltaTime);
+  // Apply movement
+  player.position.x += moveDirection.x * deltaTime;
+  player.position.z += moveDirection.z * deltaTime;
   player.position.y += velocity.y * deltaTime;
 
   // Ground check
@@ -1013,8 +1204,26 @@ function updatePlayer(deltaTime) {
     isJumping = false;
   }
 
-  // Check for collisions with obstacles
+  // Check for collisions with obstacles AFTER applying movement
   checkPlayerCollisions();
+
+  // Send state update to server (throttled)
+  const now = performance.now();
+  if (
+    socket &&
+    socket.connected &&
+    now - lastSentStateTime > stateUpdateInterval
+  ) {
+    socket.emit("playerUpdate", {
+      x: player.position.x,
+      y: player.position.y,
+      z: player.position.z,
+      rotationY: player.rotation.y, // Player body rotation
+      rotationX: camera.rotation.x, // Camera pitch
+      // Include other state like health if needed, though server might manage it
+    });
+    lastSentStateTime = now;
+  }
 }
 
 // Update bullets position
@@ -1067,207 +1276,338 @@ function togglePause() {
 
 // Animation loop
 function animate() {
-  if (!gameActive) return;
+  if (!gameActive && !socket?.connected) {
+    // Stop if game not active OR disconnected
+    // Clean up resources if needed?
+    return;
+  }
 
   requestAnimationFrame(animate);
 
   if (!isPaused) {
-    const deltaTime = Math.min(0.1, clock.getDelta());
+    const deltaTime = Math.min(0.1, clock.getDelta()); // Use clock delta for smoother updates
 
-    // Update game objects
+    // Update local player (applies input, gravity, sends updates)
     updatePlayer(deltaTime);
+
+    // Update client-side bullets
     updateBullets(deltaTime);
-    checkBulletCollisions();
-    updateHealthBars();
+    checkBulletCollisions(); // Check hits locally (now includes zombies)
 
-    // Update enemy behavior
-    updateEnemies(deltaTime);
+    // Update enemy behavior - Client only updates visuals based on server data
+    // updateEnemies(deltaTime);
+    updateZombieVisuals(); // Update health bars etc.
 
-    // Check if all enemies are defeated
+    // Update enemy health bars - REMOVED OLD CLIENT-SIDE LOGIC
+    // updateHealthBars();
+
+    // No client-side victory condition based on enemies for now
+    /*
     if (
       enemies.length === 0 ||
       enemies.every((enemy) => enemy.userData.health <= 0)
     ) {
       victory();
     }
+    */
   }
 
-  // Render the scene
+  // Render the scene (always render, even if paused)
   renderer.render(scene, camera);
 }
 
-// Simple enemy AI behavior
-function updateEnemies(deltaTime) {
-  for (let i = 0; i < enemies.length; i++) {
-    const enemy = enemies[i];
-    if (enemy.userData.health <= 0) continue;
+// Simple enemy AI behavior - REMOVED OLD CLIENT-SIDE LOGIC
+/*
+function updateEnemies(deltaTime) { ... }
+*/
 
-    // Update zombie animation
-    enemy.userData.animationTime += deltaTime * enemy.userData.animationSpeed;
-    const time = enemy.userData.animationTime;
-
-    // Animate arms and legs
-    const leftArm = enemy.children[2];
-    const rightArm = enemy.children[3];
-    const leftLeg = enemy.children[4];
-    const rightLeg = enemy.children[5];
-
-    // Swinging arms and legs
-    leftArm.rotation.x = Math.sin(time) * 0.5;
-    rightArm.rotation.x = Math.sin(time + Math.PI) * 0.5;
-    leftLeg.rotation.x = Math.sin(time + Math.PI) * 0.3;
-    rightLeg.rotation.x = Math.sin(time) * 0.3;
-
-    // Slight body sway
-    enemy.children[0].rotation.z = Math.sin(time * 0.5) * 0.1;
-
-    // Move enemies toward player if they're close enough or aggro'd
-    const distanceToPlayer = enemy.position.distanceTo(player.position);
-
-    if (distanceToPlayer < 20 || enemy.userData.isAggro) {
-      // Show health bar when in aggro range or aggro'd
-      const healthBarContainer = enemy.getObjectByName("healthBarContainer");
-      if (healthBarContainer) {
-        const backgroundBar = healthBarContainer.children[0];
-        const healthBar = healthBarContainer.children[1];
-        backgroundBar.material.opacity = 1;
-        healthBar.material.opacity = 1;
-      }
-
-      // Calculate path to player (simple for now)
-      const direction = new THREE.Vector3()
-        .subVectors(player.position, enemy.position)
-        .normalize();
-
-      // Keep direction on the ground plane
-      direction.y = 0;
-      direction.normalize();
-
-      // Check for obstacles in the way
-      const raycaster = new THREE.Raycaster(
-        enemy.position,
-        direction,
-        0,
-        distanceToPlayer
-      );
-
-      const intersects = raycaster.intersectObjects(obstacles);
-
-      if (intersects.length === 0) {
-        // No obstacles, move toward player (slower for zombies)
-        const moveAmount = direction.multiplyScalar(deltaTime * 1.5);
-        enemy.position.x += moveAmount.x;
-        enemy.position.z += moveAmount.z;
-
-        // Keep enemy on the ground
-        enemy.position.y = 0.4;
-
-        // Make enemy look at player
-        enemy.lookAt(player.position);
-
-        // Update health bar rotation to face player
-        if (healthBarContainer) {
-          healthBarContainer.lookAt(player.position);
-        }
-
-        // Damage player if enemy is too close
-        if (distanceToPlayer < 2 && gameActive) {
-          playerHealth -= 1;
-          healthElement.textContent = playerHealth;
-
-          // Game over if health reaches 0
-          if (playerHealth <= 0) {
-            gameOver();
-          }
-        }
-      } else {
-        // There's an obstacle, try to navigate around it
-        // Simple strategy: move in a random direction perpendicular to player direction
-        const perpDirection = new THREE.Vector3(-direction.z, 0, direction.x);
-        if (Math.random() > 0.5) perpDirection.negate();
-
-        const moveAmount = perpDirection.multiplyScalar(deltaTime * 1.2);
-        enemy.position.x += moveAmount.x;
-        enemy.position.z += moveAmount.z;
-
-        // Keep enemy on the ground
-        enemy.position.y = 0.4;
-
-        // Update health bar rotation to face player
-        if (healthBarContainer) {
-          healthBarContainer.lookAt(player.position);
-        }
-      }
-    } else {
-      // Hide health bar when out of aggro range and not aggro'd
-      const healthBarContainer = enemy.getObjectByName("healthBarContainer");
-      if (healthBarContainer) {
-        const backgroundBar = healthBarContainer.children[0];
-        const healthBar = healthBarContainer.children[1];
-        backgroundBar.material.opacity = 0;
-        healthBar.material.opacity = 0;
-      }
-    }
-  }
-}
-
-// Game over function
+// Game over function (triggered by health reaching 0 from server update)
 function gameOver() {
-  gameActive = false;
-  startScreen.style.display = "flex";
-  startScreen.querySelector("h1").textContent = "Game Over";
-  startScreen.querySelector("p").textContent = `Final Score: ${score}`;
-  startButton.textContent = "Play Again";
-
-  // Reset game variables
-  resetGame();
+  // This might be triggered when health reaches 0 via 'healthUpdate' or 'playerDied'
+  // The server handles respawn now, so client doesn't need to fully stop game state
+  console.log("Game Over triggered locally (likely due to health reaching 0)");
+  // Maybe show a temporary "You Died" message before respawn happens
+  //   startScreen.style.display = "flex";
+  //   startScreen.querySelector("h1").textContent = "You Died!";
+  //   startScreen.querySelector("p").textContent = `Waiting to respawn... Score: ${score}`;
+  // Don't reset game here, wait for server 'respawn' message
+  gameActive = false; // Temporarily disable input?
 }
 
-// Victory function
-function victory() {
-  gameActive = false;
-  startScreen.style.display = "flex";
-  startScreen.querySelector("h1").textContent = "You are dead";
-  startScreen.querySelector(
-    "p"
-  ).textContent = `You died with a score of ${score}!`;
-  startButton.textContent = "Play Again";
+// Victory function - REMOVED (no enemy win condition)
+/*
+function victory() { ... }
+*/
 
-  // Reset game variables
-  resetGame();
-}
-
-// Reset game state
+// Reset game state (called on Quit or Disconnect)
 function resetGame() {
-  playerHealth = 100;
+  console.log("Resetting local game state...");
+  playerHealth = 100; // Reset defaults
   score = 0;
   scoreElement.textContent = score;
   healthElement.textContent = playerHealth;
   currentWeapon = "pistol";
   updateWeaponDisplay();
 
-  // Reset weapon last fired times
   Object.keys(weapons).forEach((weapon) => {
     weapons[weapon].lastFired = 0;
   });
 
-  // Remove game objects
+  // Remove local bullets
   for (const bullet of bullets) {
     scene.remove(bullet);
   }
   bullets = [];
 
-  for (const enemy of enemies) {
-    scene.remove(enemy);
+  // Remove remote players
+  for (const playerId in remotePlayers) {
+    removeRemotePlayer(playerId);
   }
-  enemies = [];
+  remotePlayers = {};
 
-  // Remove obstacles (they will be recreated when game restarts)
-  for (const obstacle of obstacles) {
-    scene.remove(obstacle);
+  // Remove client-side zombies
+  for (const zombieId in clientZombies) {
+    removeZombie(zombieId);
   }
-  obstacles = [];
+  clientZombies = {}; // Clear the object
 
-  // Remove renderer
-  document.body.removeChild(renderer.domElement);
+  // Enemies are already disabled
+
+  // Remove obstacles? No, keep environment for next game.
+
+  // Clean up renderer only if truly quitting app, not just disconnecting
+  // if (renderer && document.body.contains(renderer.domElement)) {
+  //    document.body.removeChild(renderer.domElement);
+  //    renderer = null; // Allow garbage collection
+  // }
+  // Reset camera/player object positions if needed? Server sets initial pos.
+  if (player) player.position.set(0, 1.6, 0);
+
+  gameActive = false; // Ensure game loop stops if not already
+  isPaused = false; // Ensure not paused
+  myId = null;
+  isHost = false; // Reset host status
+  serverGameInProgress = false; // Reset game status
 }
+
+// Simple representation for remote players - REPLACED
+// const remotePlayerGeometry = new THREE.BoxGeometry(1, 1.8, 1);
+// const remotePlayerMaterial = new THREE.MeshStandardMaterial({ color: 0xff0000 }); // Red cube
+
+function addRemotePlayer(playerData) {
+  if (remotePlayers[playerData.id]) return; // Already exists
+
+  console.log(
+    `Adding remote player ${playerData.id} with weapon ${playerData.currentWeapon}`
+  );
+  const remotePlayerMesh = createFatGuyModel(); // Use the new model function
+
+  remotePlayerMesh.position.set(playerData.x, 0, playerData.z); // Set base position
+  remotePlayerMesh.rotation.y = playerData.rotationY || 0;
+
+  // Find the weapon holder and attach the initial weapon
+  const weaponHolder = remotePlayerMesh.getObjectByName("weaponHolder");
+  if (weaponHolder) {
+    const weaponMesh = createRemoteWeaponMesh(
+      playerData.currentWeapon || "pistol"
+    );
+    weaponHolder.add(weaponMesh);
+  }
+
+  scene.add(remotePlayerMesh);
+  remotePlayers[playerData.id] = { mesh: remotePlayerMesh, data: playerData };
+}
+
+function updateRemotePlayer(playerData) {
+  if (!remotePlayers[playerData.id]) {
+    console.warn(
+      `Received update for unknown player ${playerData.id}, adding.`
+    );
+    addRemotePlayer(playerData); // Attempt to add if missing
+    return;
+  }
+
+  const remotePlayer = remotePlayers[playerData.id];
+  const oldData = remotePlayer.data;
+
+  // Update position and rotation (with interpolation TODO)
+  remotePlayer.mesh.position.set(playerData.x, 0, playerData.z);
+  remotePlayer.mesh.rotation.y = playerData.rotationY;
+
+  // Update weapon model if changed
+  if (playerData.currentWeapon !== oldData.currentWeapon) {
+    console.log(
+      `Player ${playerData.id} switched weapon to ${playerData.currentWeapon}`
+    );
+    const weaponHolder = remotePlayer.mesh.getObjectByName("weaponHolder");
+    if (weaponHolder) {
+      // Remove existing weapon
+      const oldWeapon = weaponHolder.getObjectByName("remoteWeapon");
+      if (oldWeapon) {
+        weaponHolder.remove(oldWeapon);
+      }
+      // Add new weapon
+      const newWeaponMesh = createRemoteWeaponMesh(playerData.currentWeapon);
+      weaponHolder.add(newWeaponMesh);
+    }
+  }
+
+  // Update stored data
+  remotePlayer.data = playerData;
+
+  // Head/Camera Pitch
+  const head = remotePlayer.mesh.children.find(
+    (child) =>
+      child.geometry instanceof THREE.SphereGeometry && child.position.y > 1
+  );
+  if (head && playerData.rotationX !== undefined) {
+    const visualPitch = Math.max(
+      -Math.PI / 4,
+      Math.min(Math.PI / 4, playerData.rotationX)
+    );
+    head.rotation.x = visualPitch;
+  }
+}
+
+function removeRemotePlayer(playerId) {
+  if (remotePlayers[playerId]) {
+    scene.remove(remotePlayers[playerId].mesh);
+    delete remotePlayers[playerId];
+    console.log(`Removed remote player ${playerId}`);
+  }
+}
+
+// --- Remote Weapon Model Function ---
+function createRemoteWeaponMesh(weaponType) {
+  let weaponGeometry,
+    weaponMaterial,
+    scaleFactor = 0.8; // Slightly smaller for remote view
+
+  switch (weaponType) {
+    case "pistol":
+    default:
+      weaponGeometry = new THREE.BoxGeometry(
+        0.1 * scaleFactor,
+        0.1 * scaleFactor,
+        0.3 * scaleFactor
+      );
+      weaponMaterial = new THREE.MeshStandardMaterial({ color: 0x222222 });
+      break;
+    case "shotgun":
+      weaponGeometry = new THREE.BoxGeometry(
+        0.1 * scaleFactor,
+        0.1 * scaleFactor,
+        0.5 * scaleFactor
+      );
+      weaponMaterial = new THREE.MeshStandardMaterial({ color: 0x663300 });
+      break;
+    case "machineGun":
+      weaponGeometry = new THREE.BoxGeometry(
+        0.1 * scaleFactor,
+        0.1 * scaleFactor,
+        0.6 * scaleFactor
+      );
+      weaponMaterial = new THREE.MeshStandardMaterial({ color: 0x444444 });
+      break;
+  }
+  const weaponMesh = new THREE.Mesh(weaponGeometry, weaponMaterial);
+  weaponMesh.castShadow = true;
+  weaponMesh.name = "remoteWeapon"; // Give it a name for easy finding/removal
+  return weaponMesh;
+}
+// --- End Remote Weapon Model Function ---
+
+// --- Zombie Model and Management ---
+
+// Function to create the zombie model (adapted from old createEnemies)
+function createZombieModel() {
+  const zombieGroup = new THREE.Group();
+
+  // Re-use geometry definitions
+  const bodyGeometry = new THREE.BoxGeometry(0.8, 1.2, 0.4);
+  const headGeometry = new THREE.SphereGeometry(0.3, 16, 16);
+  const armGeometry = new THREE.BoxGeometry(0.2, 0.8, 0.2);
+  const legGeometry = new THREE.BoxGeometry(0.2, 0.8, 0.2);
+
+  // Material (can be reused)
+  const zombieMaterial = new THREE.MeshStandardMaterial({
+    color: 0x556b2f, // Dark green
+    roughness: 0.8,
+    metalness: 0.2,
+  });
+
+  // Create body parts
+  const body = new THREE.Mesh(bodyGeometry, zombieMaterial);
+  const head = new THREE.Mesh(headGeometry, zombieMaterial);
+  const leftArm = new THREE.Mesh(armGeometry, zombieMaterial);
+  const rightArm = new THREE.Mesh(armGeometry, zombieMaterial);
+  const leftLeg = new THREE.Mesh(legGeometry, zombieMaterial);
+  const rightLeg = new THREE.Mesh(legGeometry, zombieMaterial);
+
+  // Position body parts relative to the group origin (which will be at the zombie's feet)
+  body.position.y = 0.6 + 0.4; // Center of body raised by half height + leg height
+  head.position.y = body.position.y + 0.6 + 0.15; // Position head above body center
+  leftArm.position.set(-0.5, body.position.y, 0);
+  rightArm.position.set(0.5, body.position.y, 0);
+  leftLeg.position.set(-0.2, 0.4, 0); // Center of leg raised by half height
+  rightLeg.position.set(0.2, 0.4, 0);
+
+  // Add body parts to zombie group
+  zombieGroup.add(body);
+  zombieGroup.add(head);
+  zombieGroup.add(leftArm);
+  zombieGroup.add(rightArm);
+  zombieGroup.add(leftLeg);
+  zombieGroup.add(rightLeg);
+
+  // Add shadows
+  zombieGroup.traverse((object) => {
+    if (object instanceof THREE.Mesh) {
+      object.castShadow = true;
+      object.receiveShadow = true;
+    }
+  });
+
+  // TODO: Add health bar creation (adapted from createHealthBar)
+  // createZombieHealthBar(zombieGroup);
+
+  return zombieGroup;
+}
+
+// Add or update a zombie based on server data
+function addOrUpdateZombie(zombieData) {
+  if (clientZombies[zombieData.id]) {
+    // Update existing zombie
+    const existingZombie = clientZombies[zombieData.id];
+    // TODO: Interpolate position smoothly
+    existingZombie.mesh.position.set(zombieData.x, zombieData.y, zombieData.z);
+    existingZombie.data = zombieData; // Update stored data
+    // TODO: Update health bar visual
+  } else {
+    // Create new zombie
+    console.log("Creating mesh for new zombie:", zombieData.id);
+    const zombieMesh = createZombieModel();
+    zombieMesh.position.set(zombieData.x, zombieData.y, zombieData.z);
+    zombieMesh.userData.id = zombieData.id; // Store ID for reference
+    scene.add(zombieMesh);
+    clientZombies[zombieData.id] = { mesh: zombieMesh, data: zombieData };
+  }
+}
+
+// Remove a zombie from the scene
+function removeZombie(zombieId) {
+  if (clientZombies[zombieId]) {
+    console.log("Removing zombie mesh:", zombieId);
+    scene.remove(clientZombies[zombieId].mesh);
+    delete clientZombies[zombieId];
+  } else {
+    console.warn("Tried to remove non-existent zombie:", zombieId);
+  }
+}
+
+// TODO: Function to update zombie visuals (like health bars) based on data
+function updateZombieVisuals() {
+  // Iterate through clientZombies and update health bars, etc.
+}
+
+// --- End Zombie Management ---
